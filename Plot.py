@@ -1,129 +1,117 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
+from tqdm import tqdm
 from PPO import PPO
 from GRPO import GRPO
 from HAGRPO import HAGRPO
+from HAGRPO_fix_weight import HAGRPO_fix
 from Environment import CartPoleEnvironment
-import gym
 import seaborn as sns
-from tqdm import tqdm
 
 sns.set(style="darkgrid", font_scale=1.0, rc={
     "figure.figsize": (8, 5),
-    "axes.titlesize": 22,   # 原18 -> 20
-    "axes.labelsize": 20,   # 保持不变
-    "legend.fontsize": 14,  # 原14 -> 16
-    "xtick.labelsize": 16,  # 原12 -> 14
-    "ytick.labelsize": 16   # 原12 -> 14
+    "axes.titlesize": 22,   # 18 -> 20
+    "axes.labelsize": 20,   
+    "legend.fontsize": 14,  # 14 -> 16
+    "xtick.labelsize": 16,  # 12 -> 14
+    "ytick.labelsize": 16   # 12 -> 14
 })
 
+# General settings
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+repeat = 5
+num_iterations = 1000
+reward_threshold = 500
 
-# Plot PPO GRPO HAGRPO rewards
-def plot_results(ppo_rewards, grpo_rewards, hagrpo_rewards, num_iterations, G=16):
-    plt.figure(figsize=(12, 8))
-    plt.plot(np.arange(len(ppo_rewards)), ppo_rewards, label='PPO', color='blue')
-    plt.plot(np.arange(len(grpo_rewards)), grpo_rewards, label='GRPO', color='orange')
-    plt.plot(np.arange(len(hagrpo_rewards)), hagrpo_rewards, label='HAGRPO', color='green')
-    plt.xlabel('Iterations')
-    plt.ylabel('Reward')
-    plt.title('Comparison of PPO, GRPO, and HAGRPO on CartPole-v1')
+
+def run_algorithm(algo_name, G=None):
+    rewards_all = []
+    steps_all = []
+
+    for _ in tqdm(range(repeat), desc=f"{algo_name} G={G if G else '--'}"):
+        if algo_name == "PPO":
+            algo = PPO(env=torch.make("CartPole-v1"), num_features=4, num_actions=2, gamma=0.98, lam=1)
+            rewards, steps = algo.run_model()
+        elif algo_name == "GRPO":
+            algo = GRPO(device=device, env=CartPoleEnvironment(), num_features=4, num_actions=2, group_size=G)
+            steps = algo.train()
+            rewards = algo.rewards_per_iteration
+        elif algo_name == "HAGRPO":
+            algo = HAGRPO(device=device, env=CartPoleEnvironment(), num_features=4, num_actions=2, group_size=G)
+            steps, _ = algo.train()
+            rewards = algo.rewards_per_iteration
+        elif algo_name == "HAGRPO_fix":
+            algo = HAGRPO_fix(device=device, env=CartPoleEnvironment(), num_features=4, num_actions=2, group_size=G)
+            steps = algo.train()
+            rewards = algo.rewards_per_iteration
+        else:
+            raise ValueError("Unknown algorithm")
+
+        rewards_all.append(np.array(rewards[:num_iterations]))
+        steps_all.append(steps)
+
+    return np.array(rewards_all), np.array(steps_all)
+
+
+def pad_and_plot(reward_dict, title, filename, pad_value=500):
+    all_rewards = sum(reward_dict.values(), [])
+    max_len = max(len(r) for r in all_rewards)
+
+    def pad(arr):
+        return np.concatenate([arr, np.full(max_len - len(arr), pad_value)]) if len(arr) < max_len else arr[:max_len]
+
+    plt.figure(figsize=(10, 6))
+    for label, rewards_list in reward_dict.items():
+        rewards_padded = np.array([pad(r) for r in rewards_list])
+        mean = np.mean(rewards_padded, axis=0)
+        stderr = np.std(rewards_padded, axis=0) / np.sqrt(len(rewards_list))
+        ci95 = 1.96 * stderr
+        plt.plot(mean, label=label)
+        plt.fill_between(np.arange(max_len), mean - ci95, mean + ci95, alpha=0.1)
+
+    plt.xlabel("Iterations")
+    plt.ylabel("Reward")
+    plt.title(title)
     plt.legend()
-    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
-    # plt.show()
-    plt.savefig(f'ppo_grpo_hagrpo_rewards_{G}.pdf')
+    plt.grid()
+    plt.tight_layout()
+    plt.savefig(filename)
 
 
-ppo = PPO(
-    env=gym.make('CartPole-v1'),
-    num_features=4,
-    num_actions=2,
-    gamma=0.98,
-    lam=1
-)
-grpo = GRPO(device=device, 
-            env=CartPoleEnvironment(), 
-            num_features=4, 
-            num_actions=2,
-            group_size=16
-)
-hagrpo = HAGRPO(device=device, 
-                env=CartPoleEnvironment(), 
-                num_features=4,
-                num_actions=2,
-                group_size=16
-)
+def main():
+    G = 16
+    reward_dict = {}
+    step_dict = {}
 
-repeat = 20
-ppo_steps = []
-grpo_steps = []
-hagrpo_steps = []
-for i in tqdm(range(repeat)):
-    ppo = PPO(
-        env=gym.make('CartPole-v1'),
-        num_features=4,
-        num_actions=2,
-        gamma=0.98,
-        lam=1
-    )
-    grpo = GRPO(device=device, 
-                env=CartPoleEnvironment(), 
-                num_features=4, 
-                num_actions=2,
-                group_size=16
-    )
-    hagrpo = HAGRPO(device=device, 
-                    env=CartPoleEnvironment(), 
-                    num_features=4,
-                    num_actions=2,
-                    group_size=16
-    )
+    # Run PPO
+    ppo_rewards, ppo_steps = run_algorithm("PPO")
+    reward_dict["PPO"] = list(ppo_rewards)
+    step_dict["PPO"] = ppo_steps
 
-    ppo_rewards, ppo_step = ppo.run_model()
-    grpo_step = grpo.train()
-    grpo_rewards = grpo.rewards_per_iteration
-    hagrpo_step = hagrpo.train()
-    hagrpo_rewards = hagrpo.rewards_per_iteration
-    ppo_steps.append(ppo_step)
-    grpo_steps.append(grpo_step)
-    hagrpo_steps.append(hagrpo_step)
+    # Run GRPO
+    grpo_rewards, grpo_steps = run_algorithm("GRPO", G=G)
+    reward_dict["GRPO"] = list(grpo_rewards)
+    step_dict["GRPO"] = grpo_steps
 
-np.save("ppo_steps_v1_g16.npy", ppo_steps)
-np.save("grpo_steps_v1_g16.npy", grpo_steps)
-np.save("hagrpo_steps_v1_g16.npy", hagrpo_steps)
+    # Run HAGRPO
+    hagrpo_rewards, hagrpo_steps = run_algorithm("HAGRPO", G=G)
+    reward_dict["HAGRPO"] = list(hagrpo_rewards)
+    step_dict["HAGRPO"] = hagrpo_steps
 
-# calculate mean
-ppo_steps = np.load("ppo_steps_v1_g16.npy")
-grpo_steps = np.load("grpo_steps_v1_g16.npy")
-hagrpo_steps = np.load("hagrpo_steps_v1_g16.npy")
-ppo_mean = np.mean(ppo_steps)
-grpo_mean = np.mean(grpo_steps)
-hagrpo_mean = np.mean(hagrpo_steps)
-print(f"PPO mean steps v1 g 16 : {ppo_mean}")
-print(f"GRPO mean steps v1 g 16: {grpo_mean}")
-print(f"HAGRPO mean steps v1 g 16: {hagrpo_mean}")
+    # Run HAGRPO_fix
+    hagrpo_fix_rewards, hagrpo_fix_steps = run_algorithm("HAGRPO_fix", G=G)
+    reward_dict["HAGRPO_fix"] = list(hagrpo_fix_rewards)
+    step_dict["HAGRPO_fix"] = hagrpo_fix_steps
+
+    # Plot rewards
+    pad_and_plot(reward_dict, f"Reward Comparison (G={G})", f"reward_comparison_g{G}.pdf")
+
+    # Print steps report
+    print("\n=== Success Steps Report ===")
+    for name, steps in step_dict.items():
+        print(f"{name}: mean = {np.mean(steps):.2f}, std = {np.std(steps):.2f}")
 
 
-# with open("ppo_rewards.txt", "w") as f:
-#     for r in ppo_rewards:
-#         f.write(f"{r}\n")
-
-# with open("grpo_rewards_g16.txt", "w") as f:
-#     for r in grpo_rewards:
-#         f.write(f"{r}\n")
-
-# with open("hagrpo_rewards_g16.txt", "w") as f:
-#     for r in hagrpo_rewards:
-#         f.write(f"{r}\n")
-
-
-# ppo_rewards = np.loadtxt("ppo_rewards.txt")
-# grpo_rewards = np.loadtxt("grpo_rewards_g8.txt")
-# hagrpo_rewards = np.loadtxt("hagrpo_rewards_g8.txt")
-# print(ppo_rewards.shape)
-# print(grpo_rewards.shape)
-# print(hagrpo_rewards.shape)
-
-# plot_results(ppo_rewards, grpo_rewards, hagrpo_rewards, num_iterations=1000, G=8)
+if __name__ == "__main__":
+    main()
