@@ -11,11 +11,10 @@ from Policy import PolicyModel
 
 class GRPO:
     def __init__(self, env, num_features, num_actions, gamma=0.994, kl_beta=0.01,
-                 policy_lr=3e-4, entropy_coeff=0.01, clip_epsilon=0.2, epochs=10,
-                 group_size=16, max_steps_per_episode=500, epsilon_std=1e-8,
+                 policy_lr=1e-2, entropy_coeff=0.01, clip_epsilon=0.2, epochs=10,
+                 group_size=8, max_steps_per_episode=500, epsilon_std=1e-8,
                  num_iterations=1000, render_interval=-1, print_interval=10,
-                 policy_hidden_sizes=(40, 35, 30), batch_size=128,
-                 device=torch.device("cpu")):
+                 policy_hidden_sizes=(40, 35, 30), device=torch.device("cpu"), threshold=500):
 
         self.env = env
         self.gamma = gamma
@@ -29,7 +28,6 @@ class GRPO:
         self.num_iterations = num_iterations
         self.render_interval = render_interval
         self.print_interval = print_interval
-        self.batch_size = batch_size
         self.device = device
 
         self.policy = PolicyModel(num_features, num_actions, *policy_hidden_sizes).to(self.device)
@@ -37,7 +35,7 @@ class GRPO:
         self.policy_ref.load_state_dict(self.policy.state_dict())
         self.policy_ref.eval()
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=policy_lr)
-        self.threshold = 500.0
+        self.threshold = threshold
 
         self.rewards_per_iteration = []
         self.policy_losses = []
@@ -48,8 +46,8 @@ class GRPO:
         states_list, actions_list, log_probs_list, rewards_list = [], [], [], []
         ep_rewards = []
         self.policy.eval()
-        while len(states_list) * len(states_list[0]) < self.batch_size:  # Keep collecting until batch size is met
-            state = self.env.reset(render=(self.render_interval > 0))
+        for g in range(self.group_size):
+            state = self.env.reset(render=(self.render_interval > 0 and g == 0))
             done, step, episode_reward = False, 0, 0
             rollout_states, rollout_actions, rollout_log_probs, rollout_rewards = [], [], [], []
             while not done and step < self.max_steps:
@@ -80,7 +78,6 @@ class GRPO:
                 rewards_list.append([])
                 ep_rewards.append(0.0)
         return states_list, actions_list, log_probs_list, rewards_list, ep_rewards
-
 
     def compute_advantages(self, rewards_list):
         temp_advantages, all_advantages = [], []
@@ -145,36 +142,26 @@ class GRPO:
             states, actions, log_probs, rewards, ep_rewards = self.collect_rollouts()
             self.policy.train()
             advantages = self.compute_advantages(rewards)
-            
-            # Flatten and accumulate advantages
             advantages_flat = torch.cat(advantages).cpu().numpy()  # flatten into one array
             advantages_list.append(np.mean(advantages_flat))
-            
             self.policy_ref.load_state_dict(self.policy.state_dict())
             self.policy_ref.eval()
-            
-            # Perform policy update with the accumulated batch data
             loss, kl, entropy = self.update_policy(states, actions, log_probs, advantages)
-            
-            # Log losses and other metrics
             self.policy_losses.append(loss)
             self.kl_divergences.append(kl)
             self.entropies.append(entropy)
-            
-            # Compute the average reward for the current iteration
             avg_reward = np.mean(ep_rewards)
             self.rewards_per_iteration.append(avg_reward)
-            
-            if avg_reward >= self.threshold:  # change this to 500 for v1, 200 for v2
+            if True:
                 print(f"Iter {iter + 1}/{self.num_iterations} | Avg Reward: {avg_reward:.2f}")
-                print("Solved!")
-                return iter, advantages_list
-            print(f"Iter {iter + 1}/{self.num_iterations} | Avg Reward: {avg_reward:.2f}")
-            
+                if avg_reward >= self.threshold: # change this to 500 for v1, 200 for v2
+                    print("Solved!")
+                    return iter, advantages_list
+                       
         self.env.close()
         print("GRPO Training Complete.")
         return iter, advantages_list
-
+    
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # # Create GRPO trainer instance

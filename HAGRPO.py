@@ -14,7 +14,7 @@ class HAGRPO:
                  num_features, 
                  num_actions, 
                  gamma=0.994, 
-                 lam=1.0,
+                 lam=0.98,
                  epsilon=0.2,
                  value_network_lr=1e-3,
                  value_network_hidden_size=100,
@@ -23,7 +23,7 @@ class HAGRPO:
                  entropy_coeff=0.01, 
                  clip_epsilon=0.2, 
                  epochs=10,
-                 group_size=16, 
+                 group_size=8, 
                  max_steps_per_episode=500, 
                  epsilon_std=1e-8,
                  num_iterations=1000, 
@@ -31,7 +31,7 @@ class HAGRPO:
                  print_interval=10,
                  policy_hidden_sizes=(40, 35, 30), 
                  device=torch.device("cpu"),
-                 batch_size=128):
+                 threshold=500):
 
         self.env = env
         self.gamma = gamma
@@ -47,7 +47,6 @@ class HAGRPO:
         self.num_iterations = num_iterations
         self.render_interval = render_interval
         self.print_interval = print_interval
-        self.batch_size = batch_size
         self.device = device
 
         self.value_net = ValueNetwork(num_features, value_network_hidden_size, learning_rate=value_network_lr)
@@ -62,7 +61,7 @@ class HAGRPO:
         self.policy_losses = []
         self.entropies = []
         self.kl_divergences = []
-        self.threshold = 500.0
+        self.threshold = threshold
 
     def get_dist(self, states):
         states = torch.tensor(states, dtype=torch.float32)
@@ -73,9 +72,8 @@ class HAGRPO:
         states_list, actions_list, log_probs_list, rewards_list = [], [], [], []
         ep_rewards = []
         self.policy.eval()
-        
-        while len(states_list) * len(states_list[0]) < self.batch_size:  # Keep collecting until batch size is met
-            state = self.env.reset(render=(self.render_interval > 0))
+        for g in range(self.group_size):
+            state = self.env.reset(render=(self.render_interval > 0 and g == 0))
             done, step, episode_reward = False, 0, 0
             rollout_states, rollout_actions, rollout_log_probs, rollout_rewards = [], [], [], []
             while not done and step < self.max_steps:
@@ -93,8 +91,6 @@ class HAGRPO:
                 state = next_state
                 episode_reward += reward
                 step += 1
-            
-            # Store episode data in batch lists
             if rollout_states:
                 states_list.append(torch.stack(rollout_states))
                 actions_list.append(torch.stack(rollout_actions))
@@ -107,9 +103,7 @@ class HAGRPO:
                 log_probs_list.append(torch.empty((0,), device=self.device))
                 rewards_list.append([])
                 ep_rewards.append(0.0)
-        
         return states_list, actions_list, log_probs_list, rewards_list, ep_rewards
-
 
     def discount_rewards(self, rewards):
         discounted = np.zeros_like(rewards, dtype=np.float32)
@@ -206,7 +200,6 @@ class HAGRPO:
 
     def update_policy(self, states_list, actions_list, log_probs_list, advantages_list):
         try:
-            # Concatenate all the batches into one large batch
             states = torch.cat(states_list, dim=0).to(self.device)
             actions = torch.cat(actions_list, dim=0).to(self.device)
             log_probs_old = torch.cat(log_probs_list, dim=0).to(self.device)
@@ -214,91 +207,65 @@ class HAGRPO:
         except RuntimeError as e:
             print("Concatenation error:", e)
             raise e
-        
-        # Detach to avoid gradient calculation in advantages
         advantages = advantages.detach()
         log_probs_old = log_probs_old.detach()
-        
         self.policy_ref.eval()
         total_loss, total_kl, total_entropy = 0.0, 0.0, 0.0
-        
-        # Perform the policy update across multiple epochs
         for _ in range(self.epochs):
             probs = self.policy(states)
             dist = torch.distributions.Categorical(probs=probs)
             log_probs_new = dist.log_prob(actions)
             entropy = dist.entropy().mean()
-
-            # Calculate the PPO ratio and surrogate loss
             ratio = torch.exp(log_probs_new - log_probs_old)
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
             surrogate = torch.min(surr1, surr2).mean()
-
             with torch.no_grad():
                 ref_probs = self.policy_ref(states)
                 ref_dist = torch.distributions.Categorical(probs=ref_probs)
                 ref_log_probs = ref_dist.log_prob(actions)
-            
             log_ratio = ref_log_probs - log_probs_new.detach()
             kl = torch.exp(log_ratio) - log_ratio - 1
             kl_mean = torch.relu(kl.mean())
-
-            # Calculate final loss
             loss = -surrogate + self.kl_beta * kl_mean - self.entropy_coeff * entropy
-
-            # Backpropagate and update the policy
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
-
-            # Track metrics
             total_loss += surrogate.item()
             total_kl += kl_mean.item()
             total_entropy += entropy.item()
-        
         return total_loss / self.epochs, total_kl / self.epochs, total_entropy / self.epochs
-
 
     def train(self):
         weight_list = []
         advantages_list = []
+        # sr_list = []
+        # sv_list = []
         for iter in range(self.num_iterations):
             states, actions, log_probs, rewards, ep_rewards = self.collect_rollouts()
             self.policy.train()
-            
-            # Calculate the advantages for each rollout
+            # ==== Add this part ====
+            # TODO: calculate the advantages for each output sequence
             values = [self.value_net.get(np.array(states)) for states in states]
             advantages, weight = self.compute_advantages(rewards, values)
-            
-            # Store weight and advantages for tracking
+            # ==== End this part ====
             weight_list.append(weight)
-            advantages_flat = torch.cat(advantages).cpu().numpy()  # Flatten into one array
+            advantages_flat = torch.cat(advantages).cpu().numpy()  # flatten into one array
             advantages_list.append(np.mean(advantages_flat))
-            
-            # Update reference policy and evaluate
             self.policy_ref.load_state_dict(self.policy.state_dict())
             self.policy_ref.eval()
-            
-            # Perform the policy update with the current batch
             loss, kl, entropy = self.update_policy(states, actions, log_probs, advantages)
-            
-            # Store loss and metrics
             self.policy_losses.append(loss)
             self.kl_divergences.append(kl)
             self.entropies.append(entropy)
-            
-            # Track reward per iteration
             avg_reward = np.mean(ep_rewards)
             self.rewards_per_iteration.append(avg_reward)
-            
-            if avg_reward >= self.threshold:
+            if True:
                 print(f"Iter {iter + 1}/{self.num_iterations} | Avg Reward: {avg_reward:.2f} | KL: {kl:.4f} | Entropy: {entropy:.4f}")
-                print("Solved!")
-                return iter, weight_list, advantages_list
-            
-            print(f"Iter {iter + 1}/{self.num_iterations} | Avg Reward: {avg_reward:.2f} | KL: {kl:.4f} | Entropy: {entropy:.4f}")
-        
+                if avg_reward >= self.threshold: # change this to 500 for v1, 200 for v2
+                    print("Solved!")
+                    return iter, weight_list, advantages_list
+
         self.env.close()
         print("HAGRPO Training Complete.")
         return iter, weight_list, advantages_list

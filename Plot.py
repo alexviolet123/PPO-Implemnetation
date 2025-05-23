@@ -8,14 +8,16 @@ from HAGRPO import HAGRPO
 from HAGRPO_fix_weight import HAGRPO_fix
 from Environment import CartPoleEnvironment
 import seaborn as sns
+import gym
+import pickle
 
-sns.set(style="darkgrid", font_scale=1.0, rc={
-    "figure.figsize": (8, 5),
-    "axes.titlesize": 22,   # 18 -> 20
-    "axes.labelsize": 20,   
-    "legend.fontsize": 14,  # 14 -> 16
-    "xtick.labelsize": 16,  # 12 -> 14
-    "ytick.labelsize": 16   # 12 -> 14
+sns.set(style="darkgrid", font_scale=2.0, rc={
+    "figure.figsize": (12, 7),
+    "axes.titlesize": 32,     # 图标题
+    "axes.labelsize": 28,     # 坐标轴标签
+    "legend.fontsize": 24,    # 图例
+    "xtick.labelsize": 22,    # x 轴刻度
+    "ytick.labelsize": 22     # y 轴刻度
 })
 
 # General settings
@@ -31,15 +33,15 @@ def run_algorithm(algo_name, G=None):
 
     for _ in tqdm(range(repeat), desc=f"{algo_name} G={G if G else '--'}"):
         if algo_name == "PPO":
-            algo = PPO(env=torch.make("CartPole-v1"), num_features=4, num_actions=2, gamma=0.98, lam=1)
-            rewards, steps = algo.run_model()
+            algo = PPO(env=gym.make("CartPole-v1"), num_features=4, num_actions=2, gamma=0.98, lam=1)
+            rewards, steps, _ = algo.run_model()
         elif algo_name == "GRPO":
             algo = GRPO(device=device, env=CartPoleEnvironment(), num_features=4, num_actions=2, group_size=G)
-            steps = algo.train()
+            steps, _ = algo.train()
             rewards = algo.rewards_per_iteration
         elif algo_name == "HAGRPO":
             algo = HAGRPO(device=device, env=CartPoleEnvironment(), num_features=4, num_actions=2, group_size=G)
-            steps, _ = algo.train()
+            steps, _, _ = algo.train()
             rewards = algo.rewards_per_iteration
         elif algo_name == "HAGRPO_fix":
             algo = HAGRPO_fix(device=device, env=CartPoleEnvironment(), num_features=4, num_actions=2, group_size=G)
@@ -79,16 +81,25 @@ def pad_and_plot(reward_dict, title, filename, pad_value=500):
     plt.savefig(filename)
 
 
-def main():
-    G = 16
-    reward_dict = {}
-    step_dict = {}
+Gs = [6,8,10,12,14,16]
+reward_dict = {}
+step_dict = {}
 
-    # Run PPO
-    ppo_rewards, ppo_steps = run_algorithm("PPO")
-    reward_dict["PPO"] = list(ppo_rewards)
-    step_dict["PPO"] = ppo_steps
+# Run the PPO algorithm
+ppo_rewards, ppo_steps = run_algorithm("PPO")
 
+# Store the results in dictionaries
+reward_dict = {}
+step_dict = {}
+
+reward_dict["PPO"] = list(ppo_rewards)
+step_dict["PPO"] = ppo_steps
+
+# Save the dictionaries to a file
+with open('ppo_data.pkl', 'wb') as f:
+    pickle.dump((reward_dict, step_dict), f)
+
+for G in Gs:
     # Run GRPO
     grpo_rewards, grpo_steps = run_algorithm("GRPO", G=G)
     reward_dict["GRPO"] = list(grpo_rewards)
@@ -100,18 +111,16 @@ def main():
     step_dict["HAGRPO"] = hagrpo_steps
 
     # Run HAGRPO_fix
-    hagrpo_fix_rewards, hagrpo_fix_steps = run_algorithm("HAGRPO_fix", G=G)
-    reward_dict["HAGRPO_fix"] = list(hagrpo_fix_rewards)
-    step_dict["HAGRPO_fix"] = hagrpo_fix_steps
+    # hagrpo_fix_rewards, hagrpo_fix_steps = run_algorithm("HAGRPO_fix", G=G)
+    # reward_dict["HAGRPO_fix"] = list(hagrpo_fix_rewards)
+    # step_dict["HAGRPO_fix"] = hagrpo_fix_steps
 
     # Plot rewards
     pad_and_plot(reward_dict, f"Reward Comparison (G={G})", f"reward_comparison_g{G}.pdf")
+    np.save(f"rewards_g{G}.npy", reward_dict)
+    # read: reward_dict = np.load("rewards_g10.npy", allow_pickle=True).item()
 
     # Print steps report
     print("\n=== Success Steps Report ===")
     for name, steps in step_dict.items():
         print(f"{name}: mean = {np.mean(steps):.2f}, std = {np.std(steps):.2f}")
-
-
-if __name__ == "__main__":
-    main()

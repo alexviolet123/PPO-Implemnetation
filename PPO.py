@@ -7,16 +7,15 @@ from Policy import ValueNetwork, PolicyModel
 class PPO:
     def __init__(self, env, num_features=1, num_actions=1, gamma=0.98, lam=1.0, epsilon=0.2,
                  value_network_lr=1e-3, policy_network_lr=1e-2, value_network_hidden_size=100,
-                 policy_network_hidden_size_1=40, policy_network_hidden_size_2=35, policy_network_hidden_size_3=30,
-                 batch_size=128):
+                 policy_network_hidden_size_1=40, policy_network_hidden_size_2=35, policy_network_hidden_size_3=30, num_iter = 1000, threshold=500.0):
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.env = env
         self.num_features = num_features
         self.num_actions = num_actions
         self.gamma = gamma
         self.lam = lam
-        self.batch_size = batch_size
+        self.num_iter = num_iter
+        self.threshold = threshold
 
         self.policy = PolicyModel(num_features, num_actions,
                                   policy_network_hidden_size_1,
@@ -30,16 +29,11 @@ class PPO:
 
 
     def get_dist(self, states):
-        states = torch.tensor(states, dtype=torch.float32).to(self.device)  # Move to GPU
+        states = torch.tensor(states, dtype=torch.float32)
         with torch.no_grad():
-            return self.policy(states).cpu().numpy()  # Return to CPU after inference for NumPy
+            return self.policy(states).numpy()
 
     def compute_loss(self, states, actions, old_probs, advantages):
-        states = states.to(self.device)  # Move to GPU
-        actions = actions.to(self.device)  # Move to GPU
-        old_probs = old_probs.to(self.device)  # Move to GPU
-        advantages = advantages.to(self.device)  # Move to GPU
-
         probs = self.policy(states)
         new_probs = torch.sum(probs * actions, dim=1)
         old_probs = torch.sum(old_probs * actions, dim=1)
@@ -50,10 +44,10 @@ class PPO:
         return loss
 
     def update_policy(self, states, chosen_actions, old_probs, advantages):
-        states = torch.tensor(states, dtype=torch.float32).to(self.device)  # Move to GPU
-        chosen_actions = torch.tensor(chosen_actions, dtype=torch.float32).to(self.device)  # Move to GPU
-        old_probs = torch.tensor(old_probs, dtype=torch.float32).to(self.device)  # Move to GPU
-        advantages = torch.tensor(advantages, dtype=torch.float32).to(self.device)  # Move to GPU
+        states = torch.tensor(states, dtype=torch.float32)
+        chosen_actions = torch.tensor(chosen_actions, dtype=torch.float32)
+        old_probs = torch.tensor(old_probs, dtype=torch.float32)
+        advantages = torch.tensor(advantages, dtype=torch.float32)
 
         loss = self.compute_loss(states, chosen_actions, old_probs, advantages)
 
@@ -88,13 +82,7 @@ class PPO:
         advantage_list = []
 
         render = False
-        states_batch = []
-        actions_batch = []
-        rewards_batch = []
-        old_probs_batch = []
-        advantages_batch = []
-
-        while episode < 1000:
+        while episode < self.num_iter:
             s0, _ = self.env.reset()
             done = False
             ep_rewards = []
@@ -107,7 +95,7 @@ class PPO:
                     self.env.render()
 
                 s_array = np.asarray(s0, dtype=np.float32)
-                s_tensor = torch.from_numpy(s_array).unsqueeze(0).to(self.device)  # Convert to tensor and move to GPU
+                s_tensor = torch.from_numpy(s_array).unsqueeze(0)
 
                 probs = self.get_dist(s_tensor)
                 action = np.random.choice(self.num_actions, p=probs[0])
@@ -128,52 +116,29 @@ class PPO:
             ep_actions = np.vstack(ep_actions)
             ep_rewards = np.array(ep_rewards, dtype=np.float32)
 
-            # Store episode data in batch lists
-            states_batch.append(torch.tensor(ep_states, dtype=torch.float32).to(self.device))  # Convert to tensor and move to GPU
-            actions_batch.append(torch.tensor(ep_actions, dtype=torch.float32).to(self.device))  # Convert to tensor and move to GPU
-            rewards_batch.append(torch.tensor(ep_rewards, dtype=torch.float32).to(self.device))  # Convert to tensor and move to GPU
+            targets = self.discount_rewards(ep_rewards)
+            for i in range(len(ep_states)):
+                self.value_net.update([ep_states[i]], [targets[i]])
 
-            # If the batch size is reached, update the model
-            if len(states_batch) * len(states_batch[0]) >= self.batch_size:
-                # Flatten the batches and move them to GPU
-                states_batch = torch.cat(states_batch, dim=0).to(self.device)  # Move batch to GPU
-                actions_batch = torch.cat(actions_batch, dim=0).to(self.device)  # Move batch to GPU
-                rewards_batch = torch.cat(rewards_batch, dim=0).to(self.device)  # Move batch to GPU
+            values = self.value_net.get(ep_states)
+            advantages = self.calculate_advantages(ep_rewards, values)
+            advantage_list.append(advantages.mean(axis=0))
+            old_probs = self.get_dist(ep_states)
 
-                targets = self.discount_rewards(rewards_batch)
-                for i in range(len(states_batch)):
-                    state_tensor = states_batch[i].unsqueeze(0)  # shape: [1, state_dim]
-                    target_tensor = torch.tensor(targets[i], dtype=torch.float32).unsqueeze(0).to(self.device)  # shape: [1]
-                    self.value_net.update(state_tensor, target_tensor)
-
-
-                values = self.value_net.get(states_batch)
-                advantages = self.calculate_advantages(rewards_batch, values)
-                advantages_batch.append(advantages.mean(axis=0))
-
-                old_probs = self.get_dist(states_batch)
-                old_probs_batch.append(old_probs)
-
-                # Perform the policy update with the batch data
-                self.update_policy(states_batch, actions_batch, old_probs, advantages_batch)
-
-                # Reset the batch data
-                states_batch = []
-                actions_batch = []
-                rewards_batch = []
-                advantages_batch = []
-                old_probs_batch = []
+            self.update_policy(ep_states, ep_actions, old_probs, advantages)
 
             running_reward.append(score)
 
             if True:
                 print(f"Episode: {episode}, Rewards: {score:.2f}")
-                if score >= self.threshold:
+                if score >= self.threshold: # change this to 500 for v1, 200 for v2
                     print("Solved!")
                     render = True
                     return running_reward, episode, advantage_list
             episode += 1
         return running_reward, episode, advantage_list
+
+
 
 # Example usage
 # agent = PPO(
